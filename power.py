@@ -15,6 +15,11 @@ user = 'stefan'
 # Battery class
 #
 class Battery():
+  def __init__(self, bat = None):
+    if bat == None:
+      bat = ( d for d in os.listdir('/sys/class/power_supply/') if d.startswith('BAT') ).next()
+    self.bat = bat
+
   def level(self):
     self.update()
     return self._level
@@ -35,18 +40,27 @@ class Battery():
       name, val = l.split('=', 1)
       if val.isdigit(): val = int(val)
       return name, val
-    return { k : v for k, v in ( parse_var(l) for l in open('/sys/class/power_supply/' + 'BAT1' + '/uevent', 'r') ) }
+    return { k : v for k, v in ( parse_var(l) for l in open('/sys/class/power_supply/' + self.bat + '/uevent', 'r') ) }
 
   def update(self):
     info = self.parse_power_supply()
-    self._level = float(info['CHARGE_NOW']) / info['CHARGE_FULL']
-    if info['CURRENT_NOW']:
+    try:
+      rate = info['CURRENT_NOW']
+      full = info['CHARGE_FULL']
+      curr = info['CHARGE_NOW']
+    except KeyError:
+      rate = info['POWER_NOW']
+      full = info['ENERGY_FULL']
+      curr = info['ENERGY_NOW']
+
+    self._level = float(curr) / full
+    if rate:
       if   info['STATUS'] == 'Discharging':
-        self._time2empty = datetime.timedelta(hours = float(info['CHARGE_NOW']) / info['CURRENT_NOW'])
+        self._time2empty = datetime.timedelta(hours = float(curr) / rate)
         self._time2full  = None
       elif info['STATUS'] ==    'Charging':
         self._time2empty = None
-        self._time2full  = datetime.timedelta(hours = float(info['CHARGE_FULL'] - info['CHARGE_NOW']) / info['CURRENT_NOW'])
+        self._time2full  = datetime.timedelta(hours = float(full - curr) / rate)
       else:
         assert info['STATUS'] == 'Full'
     else:
@@ -59,7 +73,12 @@ class Battery():
 def acpiListener():
   p = subprocess.Popen('acpi_listen', stdout=subprocess.PIPE)
   while 1:
-    print(p.stdout.readline(),)
+    line = p.stdout.readline().split()
+    if line[0].startswith("video/brightness"):
+      if   line[0][16:] == "down":
+        brightnessMul(1.0/1.1)
+      elif line[0][16:] == "up":
+        brightnessMul(1.1/1.0)
     event.set()
       
 t = threading.Thread(target = acpiListener, name = 'acpiListenerThread')
@@ -82,16 +101,26 @@ def wakealarmGet():
   return open('/sys/class/rtc/rtc0/wakealarm', 'r').read()
 
 def brightnessSet(val):
-  b_max = int(open('/sys/class/backlight/radeon_bl0/max_brightness', 'r').read(), 10)
-  open('/sys/class/backlight/radeon_bl0/brightness', 'w').write(str(int(round(b_max * val))))
+  if backlight:
+    val = max(0.01, min(val, 1.0))
+    print("Brightness set to " + str(val))
+    b_max = int(open(backlight + 'max_brightness', 'r').read(), 10)
+    open(backlight + 'brightness', 'w').write(str(int(round(b_max * val))))
 
 def brightnessGet():
-  b_max = float(int(open('/sys/class/backlight/radeon_bl0/max_brightness'   , 'r').read(), 10))
-  b_act = float(int(open('/sys/class/backlight/radeon_bl0/actual_brightness', 'r').read(), 10))
-  return b_act / b_max
+  if backlight:
+    b_max = float(int(open(backlight + 'max_brightness'   , 'r').read(), 10))
+    b_act = float(int(open(backlight + 'actual_brightness', 'r').read(), 10))
+    return b_act / b_max
+  else:
+    return 1.0
+
+def brightnessMul(f):
+  if backlight:
+    brightnessSet(brightnessGet() * f)
 
 def screenOff():
-  subprocess.call(['su', '-c', 'DISPLAY=:0 XAUTHORITY=/home/stefan/.Xauthority xset dpms force off', 'stefan'])
+  subprocess.call(['su', '-c', 'DISPLAY=:0 XAUTHORITY=/home/'+user+'/.Xauthority xset dpms force off', user])
 
 def diskSpeedup():
   subprocess.call(['sync'])
@@ -103,8 +132,9 @@ def laptop_mode(delay=900, lm_settings=[2, 60, 1]):
   open('/proc/sys/vm/dirty_background_ratio'   , 'w').write(str(lm_settings[2]))
   open('/proc/sys/vm/dirty_expire_centisecs'   , 'w').write(str(    1 * 100))
   open('/proc/sys/vm/dirty_writeback_centisecs', 'w').write(str(delay * 100))
-  subprocess.call(['mount', '-o', 'remount,commit=' + str(delay), '/dev/sda1'])
-  subprocess.call(['mount', '-o', 'remount,commit=' + str(delay), '/dev/sda6'])
+  for d in os.listdir('/dev/'):
+    if d.startswith("sd"):
+      subprocess.call(['mount', '-o', 'remount,commit=' + str(delay), '/dev/' + d])
   hdparm()
 
 def hdparm():
@@ -117,8 +147,12 @@ def osd(text, size=20):
   #http://en.wikipedia.org/wiki/X_logical_font_description
   global p # Without that OSD disappears immediately
   #font="-misc-fixed-medium-r-normal--20-140-100-100-c-100-iso8859-1"
-  font="-misc-fixed-medium-r-normal--" + str(size) + "-*-*-*-*-*-*"
-  p = pyosd.osd(font=font, colour='#BBBBBB', timeout=2, pos=2, offset=0, hoffset=0, shadow=int(size*5/8), align=1, lines=1, noLocale=False)
+  font="-misc-fixed-medium-r-normal--" + str(int(size)) + "-*-*-*-*-*-*"
+  try:
+    p = pyosd.osd(font=font, colour='#BBBBBB', timeout=2, pos=2, offset=0, hoffset=0, shadow=int(size*5/8), align=1, lines=1, noLocale=False)
+  except:
+    print(font)
+    raise
   p.display(text)
 
 #
@@ -155,21 +189,18 @@ def memDelayDisk(delay = datetime.timedelta(minutes = 20)):
   if not wakealarmGet():
     disk()
 
-def brightnessMul(f):
-  brightnessSet(brightnessGet() * f)
-
 def blink(off = 0.1, on = 0.1, repeat = 1):
   for i in range(repeat):
-    curr = open('/sys/class/backlight/radeon_bl0/actual_brightness').read()
-    open('/sys/class/backlight/radeon_bl0/brightness', 'w').write('0')
+    curr = open(backlight + 'actual_brightness').read()
+    open(backlight + 'brightness', 'w').write('0')
     time.sleep(off)
-    open('/sys/class/backlight/radeon_bl0/brightness', 'w').write(curr)
+    open(backlight + 'brightness', 'w').write(curr)
     time.sleep(on)
   time.sleep(1)
 
 def lock():
   screenOff()
-  subprocess.Popen(['su', '-c', 'DISPLAY=:0 XAUTHORITY=/home/stefan/.Xauthority slock', 'stefan'])
+  subprocess.Popen(['su', '-c', 'DISPLAY=:0 XAUTHORITY=/home/'+user+'/.Xauthority slock', user])
 
 def governorSet(governor = 'ondemand'):
   print("Setting governor:", governor)
@@ -245,7 +276,7 @@ tasksIdleBatt = tasksIdleCommon + (
 )
 
 tasksIdleAC = tasksIdleCommon + (
-  ( datetime.timedelta(hours   = 1.0), lambda: backup() ),
+#  ( datetime.timedelta(hours   = 1.0), lambda: backup() ),
 )
 
 #
@@ -278,14 +309,27 @@ tasksBattLevel = (
 )
 
 laptop_mode()
+
 # AHCI saving
-open('/sys/class/scsi_host/host0/link_power_management_policy', 'w').write('min_power')
+try:
+  open('/sys/class/scsi_host/host0/link_power_management_policy', 'w').write('min_power')
+except:
+  pass
+
 # Audio saving
-#open('/sys/module/snd_hda_intel/parameters/power_save'           , 'w').write('10')
-#open('/sys/module/snd_hda_intel/parameters/power_save_controller', 'w').write('Y')
+try:
+  open('/sys/module/snd_hda_intel/parameters/power_save'           , 'w').write('10')
+  open('/sys/module/snd_hda_intel/parameters/power_save_controller', 'w').write('Y')
+except:
+  pass
+
 # Video saving
-open('/sys/class/drm/card0/device/power_method' , 'w').write('profile')
-open('/sys/class/drm/card0/device/power_profile', 'w').write('low')
+try:
+  open('/sys/class/drm/card0/device/power_method' , 'w').write('profile')
+  open('/sys/class/drm/card0/device/power_profile', 'w').write('low')
+except:
+  pass
+
 # USB saving
 usb_path = '/sys/bus/usb/devices/'
 for i in os.listdir(usb_path):
@@ -295,7 +339,22 @@ for i in os.listdir(usb_path):
     open(path + 'control'             , 'w').write('auto')
     open(path + 'autosuspend_delay_ms', 'w').write('1000')
 
-battery = Battery()
+try:
+  battery = Battery()
+except:
+  battery = None
+
+backlight_lst = os.listdir('/sys/class/backlight/')
+backlight_lst_wo_acpi = tuple(set(backlight_lst) - set(("acpi_video0", "acpi_video1")))
+try:
+  try:
+    backlight = backlight_lst_wo_acpi[0]
+  except IndexError:
+    backlight = backlight_lst[0]
+except:
+  backlight = None
+else:
+  backlight = '/sys/class/backlight/' + backlight + '/'
 
 acPrev  = None
 lidPrev = None
@@ -304,9 +363,13 @@ idlePrev = datetime.timedelta(0)
 iIdle = 0
 iBatt = 0
 
+acn = ''.join(('/sys/class/power_supply/',
+               ( d for d in os.listdir('/sys/class/power_supply/') if d.startswith('AC') ).next(),
+               '/online'))
+
 while 1:
   # State tasks
-  ac  = '1'    in open("/sys/class/power_supply/ACAD/online").read()
+  ac  = '1'    in open(acn).read()
   lid = 'open' in open('/proc/acpi/button/lid/LID/state', 'r').read()
   print("AC:", ac, "LID", lid)
   
@@ -324,7 +387,7 @@ while 1:
   # Battery tasks
   if ac:
     iBatt = 0
-  else:
+  elif battery:
     time2empty = battery.time2empty()
     if time2empty:
       print("time2empty:", str(time2empty), iBatt)
